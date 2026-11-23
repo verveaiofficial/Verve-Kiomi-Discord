@@ -4,8 +4,7 @@ import urllib.parse
 import urllib.request
 import discord
 from flask import Flask
-from google import genai
-from google.genai import types
+from openai import AsyncOpenAI
 
 app = Flask(__name__)
 
@@ -19,8 +18,12 @@ def run_web():
 
 threading.Thread(target=run_web, daemon=True).start()
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3.5-bolt-e4b")
+# NVIDIA NIM API is OpenAI-compatible
+client = AsyncOpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=os.environ.get("NVIDIA_API_KEY") or "",
+)
 TOKEN = os.environ.get("DISCORD_TOKEN")
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
@@ -84,14 +87,14 @@ async def build_contents(channel, message, bot_id):
             else:
                 continue
         if m.author.id == bot_id:
-            role, line = "model", text
+            role, line = "assistant", text
         else:
             role, line = "user", f"{author_label(m)}: {text}"
-        # Gemini wants alternating turns, so merge back-to-back messages from the same side.
+        # Merge back-to-back messages from the same side so turns alternate.
         if contents and contents[-1]["role"] == role:
-            contents[-1]["parts"][0]["text"] += "\n" + line
+            contents[-1]["content"] += "\n" + line
         else:
-            contents.append({"role": role, "parts": [{"text": line}]})
+            contents.append({"role": role, "content": line})
     return contents
 
 intents = discord.Intents.default()
@@ -115,18 +118,22 @@ class MyClient(discord.Client):
             try:
                 # Async call keeps the bot responsive and fast
                 contents = await build_contents(message.channel, message, self.user.id)
-                response = await client.aio.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        temperature=0.7
-                    )
+                response = await client.chat.completions.create(
+                    model=NVIDIA_MODEL,
+                    messages=[{"role": "system", "content": system_prompt}] + contents,
+                    temperature=0.7,
+                    max_tokens=1024,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
-                if response.text:
-                    await message.reply(response.text)
-                else:
+                text = (response.choices[0].message.content or "").strip()
+                if not text:
                     await message.reply("Received an empty response.")
+                    return
+                # Discord rejects messages over 2000 characters, so split long replies.
+                chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
+                await message.reply(chunks[0])
+                for chunk in chunks[1:]:
+                    await message.channel.send(chunk)
             except Exception as e:
                 print(f"Generation error: {type(e).__name__}: {e}")
                 await message.reply("Something went wrong. Try again.")
